@@ -271,12 +271,31 @@ export async function derivePhotoKey(
   );
 }
 
+export async function deriveTimeCapsulePhotoKey(
+  activityKey: Uint8Array,
+  capsuleSecret: Uint8Array,
+  activityId: string,
+  epoch: number,
+  contentHash: Hex,
+  targetRound: number,
+): Promise<CryptoKey> {
+  return deriveAesKey(
+    activityKey,
+    capsuleSecret,
+    `activity-photo-time-capsule-v1:${activityId}:${epoch}:${contentHash}:${targetRound}`,
+  );
+}
+
 export function photoAad(
   activityId: string,
   epoch: number,
   contentHash: Hex,
   kind: "photo" | "preview" | "metadata",
+  isTimeCapsule = false,
 ): string {
+  if (isTimeCapsule) {
+    return `activity-photo-time-capsule-v1:${activityId}:${epoch}:${contentHash}:${kind}`;
+  }
   return `activity-photo-v2:${activityId}:${epoch}:${contentHash}:${kind}`;
 }
 
@@ -287,11 +306,12 @@ export async function encryptPhotoBytes(
   epoch: number,
   contentHash: Hex,
   kind: "photo" | "preview",
+  isTimeCapsule = false,
 ): Promise<{ nonce: Hex; ciphertext: Uint8Array }> {
   const encrypted = await encryptWithKey(
     key,
     bytes,
-    photoAad(activityId, epoch, contentHash, kind),
+    photoAad(activityId, epoch, contentHash, kind, isTimeCapsule),
   );
 
   return {
@@ -308,12 +328,13 @@ export async function decryptPhotoBytes(
   epoch: number,
   contentHash: Hex,
   kind: "photo" | "preview",
+  isTimeCapsule = false,
 ): Promise<Uint8Array> {
   return decryptWithKey(
     key,
     bytesToHex(ciphertext),
     nonce,
-    photoAad(activityId, epoch, contentHash, kind),
+    photoAad(activityId, epoch, contentHash, kind, isTimeCapsule),
   );
 }
 
@@ -324,12 +345,15 @@ export async function encryptMetadata(
   activityId: string,
   epoch: number,
   contentHash: Hex,
+  isTimeCapsule = false,
 ): Promise<Uint8Array> {
   const ciphertext = await crypto.subtle.encrypt(
     {
       name: "AES-GCM",
       iv: toArrayBuffer(hexToBytes(nonce)),
-      additionalData: toArrayBuffer(utf8(photoAad(activityId, epoch, contentHash, "metadata"))),
+      additionalData: toArrayBuffer(
+        utf8(photoAad(activityId, epoch, contentHash, "metadata", isTimeCapsule)),
+      ),
     },
     key,
     toArrayBuffer(utf8(canonicalJson(metadata))),
@@ -342,12 +366,19 @@ export async function decryptMetadata(
   key: CryptoKey,
   envelope: EncryptedMetadataEnvelope,
   contentHash: Hex,
+  isTimeCapsule = false,
 ): Promise<PhotoMetadata> {
   const plaintext = await decryptWithKey(
     key,
     envelope.ciphertext,
     envelope.nonce,
-    photoAad(envelope.activityId, envelope.keyEpoch, contentHash, "metadata"),
+    photoAad(
+      envelope.activityId,
+      envelope.keyEpoch,
+      contentHash,
+      "metadata",
+      isTimeCapsule,
+    ),
   );
 
   return JSON.parse(new TextDecoder().decode(plaintext)) as PhotoMetadata;
@@ -358,5 +389,9 @@ export function newNonce(): Hex {
 }
 
 export function generateActivityKey(): Uint8Array {
+  return randomBytes(32);
+}
+
+export function generateTimeCapsuleSecret(): Uint8Array {
   return randomBytes(32);
 }

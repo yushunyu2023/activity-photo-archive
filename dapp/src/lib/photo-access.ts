@@ -3,18 +3,26 @@ import {
   decryptMetadata,
   decryptPhotoBytes,
   derivePhotoKey,
+  deriveTimeCapsulePhotoKey,
   sha256Hex,
+  wipeBytes,
 } from "@/lib/crypto";
 import {
   decryptKeyForEpoch,
   loadAndVerifyKeyManifest,
 } from "@/lib/key-manifest";
 import { fetchEncryptedBytes } from "@/lib/storage";
+import {
+  decryptTimeCapsuleSecret,
+  isTimeCapsuleUnlocked,
+  validateStoredTimeCapsule,
+} from "@/lib/time-capsule";
 import type {
   EncryptedMetadataEnvelope,
   ActivityRecord,
   PhotoMetadata,
   PhotoRecord,
+  TimeCapsuleRecord,
 } from "@/lib/types";
 
 export type DecryptedPhotoPreview = {
@@ -39,6 +47,7 @@ function validateMetadata(
   metadata: PhotoMetadata,
   activityId: string,
   photo: PhotoRecord,
+  capsule?: TimeCapsuleRecord,
 ) {
   const capturedAt = Date.parse(metadata.capturedAt);
   const descriptionLength = Array.from(metadata.description).length;
@@ -57,9 +66,73 @@ function validateMetadata(
     /[\u0000-\u001f\u007f]/.test(metadata.description) ||
     !previewTypes.has(metadata.preview.mimeType) ||
     metadata.preview.width < 1 ||
-    metadata.preview.height < 1
+    metadata.preview.height < 1 ||
+    (photo.isTimeCapsule &&
+      (!metadata.timeCapsule ||
+        metadata.timeCapsule.schemaVersion !== 1 ||
+        Date.parse(metadata.timeCapsule.unlockAt) !== Number(capsule?.unlockAt ?? 0n) * 1000 ||
+        metadata.timeCapsule.targetRound !== capsule?.targetRound ||
+        metadata.timeCapsule.chainHash.toLowerCase() !== capsule?.chainHash.toLowerCase() ||
+        metadata.timeCapsule.tlockCiphertextTxId.toLowerCase() !==
+          capsule?.tlockCiphertextTxId.toLowerCase() ||
+        metadata.timeCapsule.tlockCiphertextHash.toLowerCase() !==
+          capsule?.tlockCiphertextHash.toLowerCase())) ||
+    (!photo.isTimeCapsule && metadata.timeCapsule !== undefined)
   ) {
     throw new Error("解密后的照片元数据不符合协议");
+  }
+}
+
+async function deriveAccessiblePhotoKey(
+  activityId: string,
+  activity: ActivityRecord,
+  photo: PhotoRecord,
+  capsule: TimeCapsuleRecord | undefined,
+  account: Address,
+  accountPrivateKey: Uint8Array,
+): Promise<CryptoKey> {
+  if (photo.isTimeCapsule && !capsule) {
+    throw new Error("时间胶囊照片缺少链上时间锁记录");
+  }
+
+  const manifest = await loadAndVerifyKeyManifest(activityId, activity);
+  const activityKey = await decryptKeyForEpoch(
+    manifest,
+    account,
+    photo.keyEpoch,
+    accountPrivateKey,
+  );
+
+  try {
+    if (!photo.isTimeCapsule) {
+      return await derivePhotoKey(
+        activityKey,
+        activityId,
+        photo.keyEpoch,
+        photo.contentHash,
+      );
+    }
+
+    validateStoredTimeCapsule(capsule!);
+    if (!isTimeCapsuleUnlocked(capsule!)) {
+      throw new Error("时间胶囊尚未解锁");
+    }
+
+    const capsuleSecret = await decryptTimeCapsuleSecret(capsule!);
+    try {
+      return await deriveTimeCapsulePhotoKey(
+        activityKey,
+        capsuleSecret,
+        activityId,
+        photo.keyEpoch,
+        photo.contentHash,
+        capsule!.targetRound,
+      );
+    } finally {
+      wipeBytes(capsuleSecret);
+    }
+  } finally {
+    activityKey.fill(0);
   }
 }
 
@@ -67,26 +140,19 @@ export async function decryptPhotoPreview(
   activityId: string,
   activity: ActivityRecord,
   photo: PhotoRecord,
+  capsule: TimeCapsuleRecord | undefined,
   account: Address,
   accountPrivateKey: Uint8Array,
 ): Promise<DecryptedPhotoPreview> {
-  const manifest = await loadAndVerifyKeyManifest(activityId, activity);
-  let activityKey = await decryptKeyForEpoch(
-    manifest,
+  const photoKey = await deriveAccessiblePhotoKey(
+    activityId,
+    activity,
+    photo,
+    capsule,
     account,
-    photo.keyEpoch,
     accountPrivateKey,
   );
-  try {
-    const photoKey = await derivePhotoKey(
-      activityKey,
-      activityId,
-      photo.keyEpoch,
-      photo.contentHash,
-    );
-    activityKey.fill(0);
-    activityKey = new Uint8Array();
-
+  {
     const metadataEnvelopeBytes = await fetchEncryptedBytes(photo.metadataTxId);
     const metadataEnvelopeHash = await sha256Hex(metadataEnvelopeBytes);
     if (metadataEnvelopeHash.toLowerCase() !== photo.metadataHash.toLowerCase()) {
@@ -104,8 +170,13 @@ export async function decryptPhotoPreview(
       throw new Error("元数据密钥代际不匹配");
     }
 
-    const metadata = await decryptMetadata(photoKey, envelope, photo.contentHash);
-    validateMetadata(metadata, activityId, photo);
+    const metadata = await decryptMetadata(
+      photoKey,
+      envelope,
+      photo.contentHash,
+      photo.isTimeCapsule,
+    );
+    validateMetadata(metadata, activityId, photo, capsule);
     if (metadata.original.sha256.toLowerCase() !== photo.contentHash.toLowerCase()) {
       throw new Error("元数据中的照片哈希不匹配");
     }
@@ -119,6 +190,7 @@ export async function decryptPhotoPreview(
       photo.keyEpoch,
       photo.contentHash,
       "preview",
+      photo.isTimeCapsule,
     );
     const previewHash = await sha256Hex(previewBytes);
     if (
@@ -132,8 +204,6 @@ export async function decryptPhotoPreview(
       metadata,
       previewBytes,
     };
-  } finally {
-    activityKey.fill(0);
   }
 }
 
@@ -141,24 +211,20 @@ export async function decryptPhotoOriginal(
   activityId: string,
   activity: ActivityRecord,
   photo: PhotoRecord,
+  capsule: TimeCapsuleRecord | undefined,
   metadata: PhotoMetadata,
   account: Address,
   accountPrivateKey: Uint8Array,
 ): Promise<DecryptedPhotoOriginal> {
-  const manifest = await loadAndVerifyKeyManifest(activityId, activity);
-  const activityKey = await decryptKeyForEpoch(
-    manifest,
+  const photoKey = await deriveAccessiblePhotoKey(
+    activityId,
+    activity,
+    photo,
+    capsule,
     account,
-    photo.keyEpoch,
     accountPrivateKey,
   );
-  try {
-    const photoKey = await derivePhotoKey(
-      activityKey,
-      activityId,
-      photo.keyEpoch,
-      photo.contentHash,
-    );
+  {
     const encryptedOriginal = await fetchEncryptedBytes(photo.photoTxId);
     const originalBytes = await decryptPhotoBytes(
       photoKey,
@@ -168,6 +234,7 @@ export async function decryptPhotoOriginal(
       photo.keyEpoch,
       photo.contentHash,
       "photo",
+      photo.isTimeCapsule,
     );
     const originalHash = await sha256Hex(originalBytes);
     if (
@@ -184,7 +251,5 @@ export async function decryptPhotoOriginal(
       mimeType: metadata.original.mimeType,
       fileName: `activity-photo-${photo.contentHash.slice(2, 10)}.${extension}`,
     };
-  } finally {
-    activityKey.fill(0);
   }
 }

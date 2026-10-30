@@ -1,10 +1,8 @@
 import { defineChain } from "viem";
 import { createConfig, http } from "wagmi";
-import {
-  coinbaseWallet,
-  injected,
-  walletConnect,
-} from "wagmi/connectors";
+import { coinbaseWallet } from "wagmi/connectors/coinbaseWallet";
+import { injected } from "wagmi/connectors/injected";
+import { walletConnect } from "wagmi/connectors/walletConnect";
 import { base, baseSepolia } from "wagmi/chains";
 
 const projectId = process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID;

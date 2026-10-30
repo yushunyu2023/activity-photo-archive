@@ -5,6 +5,7 @@ import {
   Camera,
   CheckCircle2,
   CircleAlert,
+  Clock3,
   ImagePlus,
   KeyRound,
   LoaderCircle,
@@ -39,14 +40,18 @@ import {
 import { isKeyVaultSessionError } from "@/lib/key-vault-session";
 import {
   derivePhotoKey,
+  deriveTimeCapsulePhotoKey,
   encryptMetadata,
   encryptPhotoBytes,
+  generateTimeCapsuleSecret,
   newNonce,
   sha256Hex,
+  wipeBytes,
 } from "@/lib/crypto";
 import {
   findPhotoByContentHash,
   readActivity,
+  readTimeCapsule,
 } from "@/lib/activity-queries";
 import {
   countCharacters,
@@ -58,6 +63,12 @@ import {
 import { toDateTimeLocalValue } from "@/lib/format";
 import { uploadEncryptedBytes } from "@/lib/storage";
 import {
+  QUICKNET,
+  createQuicknetClient,
+  encryptTimeCapsuleSecret,
+  validateUnlockAt,
+} from "@/lib/time-capsule";
+import {
   TrackedTransactionError,
 } from "@/lib/transaction-tracking";
 import type { TrackedTransactionOptions } from "@/lib/transaction-tracking";
@@ -68,6 +79,7 @@ import {
 import type {
   EncryptedMetadataEnvelope,
   PhotoMetadata,
+  TimeCapsuleRecord,
 } from "@/lib/types";
 import { TARGET_CHAIN } from "@/lib/wagmi";
 
@@ -89,7 +101,15 @@ type UploadItem = {
   message?: string;
   contentHash?: Hex;
   pendingTransactionHash?: Hex;
+  timeCapsuleEnabled: boolean;
+  unlockAt: string;
 };
+
+function defaultCapsuleUnlockAt(): string {
+  const nextHour = new Date(Date.now() + 60 * 60 * 1000);
+  nextHour.setSeconds(0, 0);
+  return toDateTimeLocalValue(nextHour);
+}
 
 export function UploadPage({ activityId }: { activityId: string }) {
   const id = BigInt(activityId);
@@ -151,6 +171,11 @@ export function UploadPage({ activityId }: { activityId: string }) {
     Boolean(accessQuery.data) &&
     manifestReady &&
     !uploading;
+  const isOwner = Boolean(
+    address &&
+      activityQuery.data &&
+      address.toLowerCase() === activityQuery.data.owner.toLowerCase(),
+  );
 
   useEffect(() => {
     itemsRef.current = items;
@@ -189,6 +214,8 @@ export function UploadPage({ activityId }: { activityId: string }) {
           previewUrl: URL.createObjectURL(file),
           description: "",
           capturedAt: toDateTimeLocalValue(captured),
+          timeCapsuleEnabled: false,
+          unlockAt: defaultCapsuleUnlockAt(),
           status: "ready",
         };
       }),
@@ -340,6 +367,29 @@ export function UploadPage({ activityId }: { activityId: string }) {
       return;
     }
 
+    const invalidCapsule = pendingItems.find((item) => {
+      if (!item.timeCapsuleEnabled) return false;
+      if (!isOwner) return true;
+      try {
+        const unlockAtMs = new Date(item.unlockAt).getTime();
+        if (unlockAtMs % 60_000 !== 0) return true;
+        validateUnlockAt(Math.floor(unlockAtMs / 1000));
+        return false;
+      } catch {
+        return true;
+      }
+    });
+    if (invalidCapsule) {
+      pushToast({
+        tone: "error",
+        title: "时间胶囊设置无效",
+        description: isOwner
+          ? "解锁时间必须按分钟选择、晚于当前时间，且不超过 30 天。"
+          : "只有活动所有者可以创建时间胶囊。",
+      });
+      return;
+    }
+
     setUploading(true);
     const activityKeyHolder: { current: Uint8Array | null } = {
       current: null,
@@ -365,7 +415,13 @@ export function UploadPage({ activityId }: { activityId: string }) {
           assertSessionCurrent();
           let contentHash: Hex | undefined;
           let transactionHash: Hex | undefined;
+          let capsuleSecret: Uint8Array | null = null;
+          let unlockAt: bigint | undefined;
+          let targetRound: number | undefined;
+          let tlockCiphertextTxId: Hex | undefined;
+          let tlockCiphertextHash: Hex | undefined;
           try {
+            const publishAsTimeCapsule = item.timeCapsuleEnabled;
             updateItem(item.id, { status: "processing", message: "读取原图并生成预览" });
             const originalBytes = await readFileBytes(item.file);
             const currentContentHash = await sha256Hex(originalBytes);
@@ -379,6 +435,16 @@ export function UploadPage({ activityId }: { activityId: string }) {
               throw new Error("拍摄时间不能超过当前时间 24 小时");
             }
             const capturedAt = BigInt(Math.floor(capturedAtMs / 1000));
+
+            if (publishAsTimeCapsule) {
+              if (!isOwner) throw new Error("只有活动所有者可以创建时间胶囊");
+              const unlockAtMs = new Date(item.unlockAt).getTime();
+              if (unlockAtMs % 60_000 !== 0) {
+                throw new Error("时间胶囊解锁时间必须按分钟选择");
+              }
+              targetRound = validateUnlockAt(Math.floor(unlockAtMs / 1000));
+              unlockAt = BigInt(Math.floor(unlockAtMs / 1000));
+            }
 
             const existingPhoto = await findPhotoByContentHash(
               publicClient as unknown as PublicClient,
@@ -405,12 +471,38 @@ export function UploadPage({ activityId }: { activityId: string }) {
 
             const preview = await createPreview(item.file);
             const previewHash = await sha256Hex(preview.bytes);
-            const photoKey = await derivePhotoKey(
-              activityKeyHolder.current,
-              activityId,
-              activityQuery.data.keyEpoch,
-              currentContentHash,
-            );
+            let tlockCiphertextBytes: Uint8Array | undefined;
+            if (publishAsTimeCapsule && targetRound !== undefined) {
+              updateItem(item.id, {
+                status: "processing",
+                message: "正在生成时间锁",
+              });
+              capsuleSecret = generateTimeCapsuleSecret();
+              const armored = await encryptTimeCapsuleSecret(
+                capsuleSecret,
+                { targetRound },
+                createQuicknetClient(),
+              );
+              tlockCiphertextBytes = utf8(armored);
+              tlockCiphertextHash = await sha256Hex(tlockCiphertextBytes);
+            }
+
+            const photoKey =
+              publishAsTimeCapsule && capsuleSecret && targetRound !== undefined
+                ? await deriveTimeCapsulePhotoKey(
+                    activityKeyHolder.current,
+                    capsuleSecret,
+                    activityId,
+                    activityQuery.data.keyEpoch,
+                    currentContentHash,
+                    targetRound,
+                  )
+                : await derivePhotoKey(
+                    activityKeyHolder.current,
+                    activityId,
+                    activityQuery.data.keyEpoch,
+                    currentContentHash,
+                  );
             const encryptedOriginal = await encryptPhotoBytes(
               photoKey,
               originalBytes,
@@ -418,6 +510,7 @@ export function UploadPage({ activityId }: { activityId: string }) {
               activityQuery.data.keyEpoch,
               currentContentHash,
               "photo",
+              publishAsTimeCapsule,
             );
             const encryptedPreview = await encryptPhotoBytes(
               photoKey,
@@ -426,11 +519,17 @@ export function UploadPage({ activityId }: { activityId: string }) {
               activityQuery.data.keyEpoch,
               currentContentHash,
               "preview",
+              publishAsTimeCapsule,
             );
 
             assertSessionCurrent();
-            updateItem(item.id, { status: "uploading", message: "上传加密原图和预览" });
-            const [photoReceipt, previewReceipt] = await Promise.all([
+            updateItem(item.id, {
+              status: "uploading",
+              message: publishAsTimeCapsule
+                ? "上传加密原图、预览和时间锁密文"
+                : "上传加密原图和预览",
+            });
+            const [photoReceipt, previewReceipt, tlockReceipt] = await Promise.all([
               uploadEncryptedBytes(encryptedOriginal.ciphertext, "application/octet-stream", {
                 app: "activity-photo-dapp",
                 type: "photo",
@@ -443,8 +542,21 @@ export function UploadPage({ activityId }: { activityId: string }) {
                 activityId,
                 keyEpoch: String(activityQuery.data.keyEpoch),
               }),
+              tlockCiphertextBytes
+                ? uploadEncryptedBytes(
+                    tlockCiphertextBytes,
+                    "application/octet-stream",
+                    {
+                      app: "activity-photo-dapp",
+                      type: "time-capsule",
+                      activityId,
+                      keyEpoch: String(activityQuery.data.keyEpoch),
+                    },
+                  )
+                : Promise.resolve(undefined),
             ]);
             assertSessionCurrent();
+            tlockCiphertextTxId = tlockReceipt?.txId;
 
             const metadata: PhotoMetadata = {
               schemaVersion: 2,
@@ -474,6 +586,22 @@ export function UploadPage({ activityId }: { activityId: string }) {
                 originalNonce: encryptedOriginal.nonce,
                 previewNonce: encryptedPreview.nonce,
               },
+              ...(publishAsTimeCapsule &&
+              unlockAt !== undefined &&
+              targetRound !== undefined &&
+              tlockCiphertextTxId &&
+              tlockCiphertextHash
+                ? {
+                    timeCapsule: {
+                      schemaVersion: 1 as const,
+                      unlockAt: new Date(Number(unlockAt) * 1000).toISOString(),
+                      targetRound,
+                      chainHash: QUICKNET.chainHash,
+                      tlockCiphertextTxId,
+                      tlockCiphertextHash,
+                    },
+                  }
+                : {}),
             };
 
             const metadataNonce = newNonce();
@@ -484,6 +612,7 @@ export function UploadPage({ activityId }: { activityId: string }) {
               activityId,
               activityQuery.data.keyEpoch,
               currentContentHash,
+              publishAsTimeCapsule,
             );
             const envelope: EncryptedMetadataEnvelope = {
               schemaVersion: 2,
@@ -520,6 +649,7 @@ export function UploadPage({ activityId }: { activityId: string }) {
                 activityId,
                 contentHash: currentContentHash,
                 keyEpoch: activityQuery.data.keyEpoch,
+                isTimeCapsule: publishAsTimeCapsule,
               },
               onStatus: (state) => {
                 if (state.transactionHash) transactionHash = state.transactionHash;
@@ -546,12 +676,49 @@ export function UploadPage({ activityId }: { activityId: string }) {
                   id,
                   currentContentHash,
                 );
-                return existing
-                  ? { satisfied: true, result: existing }
-                  : { satisfied: false };
+                if (!existing) return { satisfied: false };
+                if (existing.photo.isTimeCapsule !== publishAsTimeCapsule) {
+                  throw new Error("同一张原图已按另一种照片模式发布，不能重复登记");
+                }
+                return { satisfied: true, result: existing };
               },
               send: () => {
                 assertSessionCurrent();
+                if (publishAsTimeCapsule) {
+                  if (
+                    unlockAt === undefined ||
+                    targetRound === undefined ||
+                    !tlockCiphertextTxId ||
+                    !tlockCiphertextHash
+                  ) {
+                    throw new Error("时间胶囊链上参数尚未准备完成");
+                  }
+                  return writeContractAsync({
+                    address: requireRegistryAddress(),
+                    abi: ACTIVITY_PHOTO_REGISTRY_ABI,
+                    functionName: "publishTimeCapsule",
+                    args: [
+                      id,
+                      photoReceipt.txId,
+                      metadataReceipt.txId,
+                      currentContentHash,
+                      metadataHash,
+                      capturedAt,
+                      activityQuery.data.keyEpoch,
+                      {
+                        unlockAt,
+                        targetRound,
+                        period: QUICKNET.period,
+                        genesisTime: BigInt(QUICKNET.genesisTime),
+                        chainHash: QUICKNET.chainHash,
+                        publicKey: QUICKNET.publicKey,
+                        schemeID: QUICKNET.schemeID,
+                        tlockCiphertextTxId,
+                        tlockCiphertextHash,
+                      },
+                    ],
+                  });
+                }
                 return writeContractAsync({
                   address: requireRegistryAddress(),
                   abi: ACTIVITY_PHOTO_REGISTRY_ABI,
@@ -576,9 +743,30 @@ export function UploadPage({ activityId }: { activityId: string }) {
                 if (
                   !existing ||
                   existing.photo.publisher.toLowerCase() !== address.toLowerCase() ||
-                  existing.photo.keyEpoch !== activityQuery.data.keyEpoch
+                  existing.photo.keyEpoch !== activityQuery.data.keyEpoch ||
+                  existing.photo.isTimeCapsule !== publishAsTimeCapsule
                 ) {
                   throw new Error("交易已上链，但照片业务状态尚未匹配");
+                }
+                if (publishAsTimeCapsule) {
+                  const storedCapsule = await readTimeCapsule(
+                    publicClient as unknown as PublicClient,
+                    existing.assetId,
+                  );
+                  if (
+                    unlockAt === undefined ||
+                    targetRound === undefined ||
+                    !tlockCiphertextTxId ||
+                    !tlockCiphertextHash ||
+                    storedCapsule.unlockAt !== unlockAt ||
+                    storedCapsule.targetRound !== targetRound ||
+                    storedCapsule.tlockCiphertextTxId.toLowerCase() !==
+                      tlockCiphertextTxId.toLowerCase() ||
+                    storedCapsule.tlockCiphertextHash.toLowerCase() !==
+                      tlockCiphertextHash.toLowerCase()
+                  ) {
+                    throw new Error("交易已上链，但时间胶囊承诺尚未匹配");
+                  }
                 }
                 rememberPublishedAsset(existing.assetId);
                 return existing;
@@ -629,6 +817,8 @@ export function UploadPage({ activityId }: { activityId: string }) {
               });
               break;
             }
+          } finally {
+            wipeBytes(capsuleSecret);
           }
         }
 
@@ -746,6 +936,13 @@ export function UploadPage({ activityId }: { activityId: string }) {
     );
   }
 
+  const capsuleMinimum = toDateTimeLocalValue(
+    new Date(Math.ceil((Date.now() + 60_000) / 60_000) * 60_000),
+  );
+  const capsuleMaximum = toDateTimeLocalValue(
+    new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+  );
+
   return (
     <div className="upload-layout">
       <div className="upload-main">
@@ -852,6 +1049,57 @@ export function UploadPage({ activityId }: { activityId: string }) {
                     />
                   </label>
                 </div>
+                {isOwner ? (
+                  <div className="time-capsule-editor">
+                    <label className="time-capsule-toggle">
+                      <input
+                        type="checkbox"
+                        checked={item.timeCapsuleEnabled}
+                        disabled={uploading || item.status === "done"}
+                        onChange={(event) => {
+                          const enabled = event.target.checked;
+                          updateItem(item.id, {
+                            timeCapsuleEnabled: enabled,
+                            unlockAt:
+                              enabled &&
+                              new Date(item.unlockAt).getTime() <= Date.now()
+                                ? defaultCapsuleUnlockAt()
+                                : item.unlockAt,
+                          });
+                        }}
+                      />
+                      <span>
+                        <Clock3 size={15} />
+                        设为时间胶囊
+                      </span>
+                    </label>
+                    {item.timeCapsuleEnabled ? (
+                      <div className="time-capsule-fields">
+                        <label className="field">
+                          <span>解锁时间（本地时区）</span>
+                          <input
+                            type="datetime-local"
+                            aria-label="时间胶囊解锁时间"
+                            value={item.unlockAt}
+                            min={capsuleMinimum}
+                            max={capsuleMaximum}
+                            step={60}
+                            disabled={uploading || item.status === "done"}
+                            onChange={(event) =>
+                              updateItem(item.id, {
+                                unlockAt: event.target.value,
+                              })
+                            }
+                          />
+                        </label>
+                        <p>
+                          解锁不会早于设定时间；正常网络下可能晚约数秒，Drand
+                          或网络异常时可能延迟更久。发布后不可修改。
+                        </p>
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
                 <div className={`upload-status upload-status-${item.status}`}>
                   {item.status === "done" ? (
                     <CheckCircle2 size={15} />

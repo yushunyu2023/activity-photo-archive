@@ -4,6 +4,8 @@ import {
   ArrowLeft,
   Camera,
   CircleAlert,
+  Clock3,
+  Eye,
   KeyRound,
   LoaderCircle,
   LockKeyhole,
@@ -19,6 +21,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type ReactNode,
 } from "react";
 import type { Address, PublicClient } from "viem";
 import {
@@ -46,11 +49,17 @@ import {
 import { formatUnixDate, shortAddress } from "@/lib/format";
 import {
   createEmptyManifest,
+  findGrant,
   grantActivityKey,
   isKeyManifest,
+  loadAndVerifyKeyManifest,
   uploadKeyManifest,
 } from "@/lib/key-manifest";
 import { decryptPhotoPreview } from "@/lib/photo-access";
+import {
+  isTimeCapsuleUnlocked,
+  verifyTimeCapsuleBeacon,
+} from "@/lib/time-capsule";
 import {
   decodeContractError,
   describeTransactionError,
@@ -59,6 +68,7 @@ import type {
   ActivityRecord,
   KeyManifest,
   PhotoRecord,
+  TimeCapsuleRecord,
 } from "@/lib/types";
 import { TARGET_CHAIN } from "@/lib/wagmi";
 
@@ -69,6 +79,7 @@ type ActivityPageProps = {
 function PhotoCard({
   assetId,
   photo,
+  capsule,
   activity,
   activityId,
   account,
@@ -77,6 +88,7 @@ function PhotoCard({
 }: {
   assetId: `0x${string}`;
   photo: PhotoRecord;
+  capsule?: TimeCapsuleRecord;
   activity: ActivityRecord;
   activityId: string;
   account: Address;
@@ -85,16 +97,67 @@ function PhotoCard({
 }) {
   const {
     runWithPrivateKey,
+    publicKey,
     sessionGeneration,
     unlocked,
   } = useKeyVault();
   const cardRef = useRef<HTMLElement | null>(null);
   const [visible, setVisible] = useState(false);
   const [imageLoaded, setImageLoaded] = useState(false);
+  const [now, setNow] = useState(() => Date.now());
+  const [viewRequested, setViewRequested] = useState(false);
+
+  useEffect(() => {
+    if (!capsule || !unlocked) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [capsule, unlocked]);
+
+  const capsuleAccessQuery = useQuery({
+    queryKey: [
+      "time-capsule-access",
+      assetId,
+      account,
+      publicKey,
+      photo.keyEpoch,
+    ],
+    enabled: Boolean(capsule && unlocked && publicKey),
+    queryFn: async () => {
+      const manifest = await loadAndVerifyKeyManifest(activityId, activity);
+      return Boolean(findGrant(manifest, account, photo.keyEpoch, publicKey!));
+    },
+  });
+
+  const capsuleUnlocked = Boolean(
+    capsule && isTimeCapsuleUnlocked(capsule, now),
+  );
+  const capsuleReadyQuery = useQuery({
+    queryKey: [
+      "time-capsule-beacon",
+      assetId,
+      capsule?.targetRound,
+      capsuleUnlocked,
+    ],
+    enabled: Boolean(
+      capsule &&
+        unlocked &&
+        capsuleAccessQuery.data &&
+        capsuleUnlocked,
+    ),
+    retry: false,
+    refetchInterval: (query) =>
+      query.state.status === "error" ? 10_000 : false,
+    queryFn: () => verifyTimeCapsuleBeacon(capsule!),
+  });
 
   const previewQuery = useQuery({
     queryKey: ["photo-preview", assetId, account, sessionGeneration],
-    enabled: unlocked,
+    enabled: Boolean(
+      unlocked &&
+        (!photo.isTimeCapsule ||
+          (viewRequested && capsuleReadyQuery.data === capsule?.targetRound)),
+    ),
     gcTime: 0,
     queryFn: async () => {
       const result = await runWithPrivateKey((privateKey) =>
@@ -102,6 +165,7 @@ function PhotoCard({
           activityId,
           activity,
           photo,
+          capsule,
           account,
           privateKey,
         ),
@@ -144,6 +208,117 @@ function PhotoCard({
     };
   }, [previewQuery.data?.previewUrl]);
 
+  const countdown = capsule
+    ? Math.max(
+        0,
+        Number(capsule.unlockAt) * 1000 - now,
+      )
+    : 0;
+  const countdownText = (() => {
+    const totalMinutes = Math.ceil(countdown / 60_000);
+    const days = Math.floor(totalMinutes / (24 * 60));
+    const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+    const minutes = totalMinutes % 60;
+    return days > 0
+      ? `${days} 天 ${hours} 小时`
+      : hours > 0
+        ? `${hours} 小时 ${minutes} 分`
+        : `${Math.max(1, minutes)} 分`;
+  })();
+
+  let frameContent: ReactNode;
+  if (!unlocked) {
+    frameContent = (
+      <div className="photo-locked photo-state-fade">
+        <LockKeyhole size={21} />
+        <span>请先在右上角解锁安全密码</span>
+      </div>
+    );
+  } else if (capsule && capsuleAccessQuery.isLoading) {
+    frameContent = (
+      <div className="photo-locked photo-skeleton">
+        <LoaderCircle className="spin" size={21} />
+        <span>正在核对胶囊代际权限</span>
+      </div>
+    );
+  } else if (capsule && capsuleAccessQuery.data === false) {
+    frameContent = (
+      <div className="photo-locked photo-locked-error photo-state-fade">
+        <KeyRound size={21} />
+        <span>当前钱包没有第 {photo.keyEpoch} 代查看权限</span>
+      </div>
+    );
+  } else if (capsule && !capsuleUnlocked) {
+    frameContent = (
+      <div className="photo-locked time-capsule-locked photo-state-fade">
+        <Clock3 size={23} />
+        <strong>时间胶囊锁定中</strong>
+        <span>约 {countdownText} 后检查时间证明</span>
+      </div>
+    );
+  } else if (capsule && capsuleReadyQuery.isLoading) {
+    frameContent = (
+      <div className="photo-locked photo-skeleton">
+        <LoaderCircle className="spin" size={21} />
+        <span>正在验证目标时间证明</span>
+      </div>
+    );
+  } else if (capsule && capsuleReadyQuery.isError) {
+    frameContent = (
+      <div className="photo-locked photo-locked-error photo-state-fade">
+        <Clock3 size={21} />
+        <strong>正在等待时间证明</strong>
+        <span>Drand 或网络异常时可能延迟更久</span>
+        <button type="button" onClick={() => void capsuleReadyQuery.refetch()}>
+          重新检查
+        </button>
+      </div>
+    );
+  } else if (capsule && !viewRequested) {
+    frameContent = (
+      <div className="photo-locked time-capsule-ready photo-state-fade">
+        <Eye size={23} />
+        <strong>时间证明已验证</strong>
+        <span>点击后才解密并加载预览</span>
+        <button type="button" onClick={() => setViewRequested(true)}>
+          查看照片
+        </button>
+      </div>
+    );
+  } else if (previewQuery.isLoading) {
+    frameContent = (
+      <div className="photo-locked photo-skeleton">
+        <LoaderCircle className="spin" size={21} />
+        <span>正在解密预览</span>
+      </div>
+    );
+  } else if (previewQuery.isError) {
+    frameContent = (
+      <div className="photo-locked photo-locked-error photo-state-fade">
+        <KeyRound size={21} />
+        <span>
+          {previewQuery.error instanceof Error
+            ? previewQuery.error.message || "照片解密失败"
+            : "照片解密失败"}
+        </span>
+      </div>
+    );
+  } else if (previewQuery.data) {
+    frameContent = (
+      <Link href={`/asset/${assetId}`} aria-label="查看照片详情">
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          className={imageLoaded ? "photo-image-loaded" : ""}
+          src={previewQuery.data.previewUrl}
+          alt={previewQuery.data.metadata.description}
+          onLoad={() => setImageLoaded(true)}
+        />
+      </Link>
+    );
+  } else {
+    frameContent = null;
+  }
+
   return (
     <article
       ref={cardRef}
@@ -155,42 +330,22 @@ function PhotoCard({
       ].filter(Boolean).join(" ")}
       style={{ "--reveal-delay": `${Math.min(index, 12) * 35}ms` } as CSSProperties}
     >
-      <Link className="photo-frame" href={`/asset/${assetId}`}>
-        {!unlocked ? (
-          <div className="photo-locked photo-state-fade">
-            <LockKeyhole size={21} />
-            <span>请先在右上角解锁安全密码</span>
-          </div>
-        ) : previewQuery.isLoading ? (
-          <div className="photo-locked photo-skeleton">
-            <LoaderCircle className="spin" size={21} />
-            <span>正在解密预览</span>
-          </div>
-        ) : previewQuery.isError ? (
-          <div className="photo-locked photo-locked-error photo-state-fade">
-            <KeyRound size={21} />
-            <span>
-              {previewQuery.error instanceof Error
-                ? previewQuery.error.message || "照片解密失败"
-                : "照片解密失败"}
-            </span>
-          </div>
-        ) : previewQuery.data ? (
-          // eslint-disable-next-line @next/next/no-img-element
-          <img
-            className={imageLoaded ? "photo-image-loaded" : ""}
-            src={previewQuery.data.previewUrl}
-            alt={previewQuery.data.metadata.description}
-            onLoad={() => setImageLoaded(true)}
-          />
-        ) : null}
-      </Link>
+      <div className="photo-frame">{frameContent}</div>
       <div className="photo-card-copy">
         <div className="photo-date">{formatUnixDate(photo.capturedAt)}</div>
-        <h3>{previewQuery.data?.metadata.description ?? "加密照片"}</h3>
+        <h3>
+          {previewQuery.data?.metadata.description ??
+            (photo.isTimeCapsule ? "时间胶囊照片" : "加密照片")}
+        </h3>
         <p>
           上传者 {shortAddress(photo.publisher)} · 密钥代际 {photo.keyEpoch}
         </p>
+        {capsule ? (
+          <span className="time-capsule-badge">
+            <Clock3 size={11} />
+            时间胶囊 · {formatUnixDate(capsule.unlockAt)}
+          </span>
+        ) : null}
       </div>
     </article>
   );
@@ -633,12 +788,13 @@ export function ActivityPage({ activityId }: ActivityPageProps) {
             <span>按拍摄时间倒序</span>
           </div>
           <div className="photo-grid">
-            {photosQuery.data.map(({ assetId, photo }, index) =>
+            {photosQuery.data.map(({ assetId, photo, capsule }, index) =>
               address && unlocked ? (
                 <PhotoCard
                   key={assetId}
                   assetId={assetId}
                   photo={photo}
+                  capsule={capsule}
                   activity={activity}
                   activityId={activityId}
                   account={address}

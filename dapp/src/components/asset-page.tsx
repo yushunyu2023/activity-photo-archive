@@ -3,7 +3,9 @@
 import {
   ArrowLeft,
   CalendarDays,
+  Clock3,
   Download,
+  Eye,
   ExternalLink,
   Fingerprint,
   KeyRound,
@@ -30,6 +32,7 @@ import {
 import {
   readActivity,
   readPhoto,
+  readTimeCapsule,
 } from "@/lib/activity-queries";
 import {
   formatUnixDate,
@@ -43,6 +46,14 @@ import {
   decryptPhotoPreview,
   decryptPhotoOriginal,
 } from "@/lib/photo-access";
+import {
+  findGrant,
+  loadAndVerifyKeyManifest,
+} from "@/lib/key-manifest";
+import {
+  isTimeCapsuleUnlocked,
+  verifyTimeCapsuleBeacon,
+} from "@/lib/time-capsule";
 import { TARGET_CHAIN } from "@/lib/wagmi";
 
 export function AssetPage({ assetId }: { assetId: `0x${string}` }) {
@@ -51,11 +62,14 @@ export function AssetPage({ assetId }: { assetId: `0x${string}` }) {
   const publicClient = usePublicClient();
   const {
     runWithPrivateKey,
+    publicKey,
     sessionGeneration,
     unlocked,
   } = useKeyVault();
   const { pushToast } = useToast();
   const [downloading, setDownloading] = useState(false);
+  const [now, setNow] = useState(() => Date.now());
+  const [viewRequested, setViewRequested] = useState(false);
   const wrongNetwork = isConnected && chainId !== TARGET_CHAIN.id;
 
   const detailQuery = useQuery({
@@ -70,6 +84,9 @@ export function AssetPage({ assetId }: { assetId: `0x${string}` }) {
       const client = publicClient as unknown as PublicClient;
       const photo = await readPhoto(client, assetId);
       const activity = await readActivity(client, photo.activityId);
+      const capsule = photo.isTimeCapsule
+        ? await readTimeCapsule(client, assetId)
+        : undefined;
       const canView = address
         ? Boolean(
             await client.readContract({
@@ -80,8 +97,72 @@ export function AssetPage({ assetId }: { assetId: `0x${string}` }) {
             }),
           )
         : false;
-      return { photo, activity, canView };
+      return { photo, activity, capsule, canView };
     },
+  });
+
+  const capsule = detailQuery.data?.capsule;
+
+  useEffect(() => {
+    if (!capsule || !unlocked) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [capsule, unlocked]);
+
+  const capsuleAccessQuery = useQuery({
+    queryKey: [
+      "asset-time-capsule-access",
+      assetId,
+      address,
+      publicKey,
+      detailQuery.data?.photo.keyEpoch,
+    ],
+    enabled: Boolean(
+      capsule &&
+        unlocked &&
+        address &&
+        publicKey &&
+        detailQuery.data?.activity &&
+        detailQuery.data?.canView,
+    ),
+    queryFn: async () => {
+      const manifest = await loadAndVerifyKeyManifest(
+        detailQuery.data!.photo.activityId.toString(),
+        detailQuery.data!.activity,
+      );
+      return Boolean(
+        findGrant(
+          manifest,
+          address!,
+          detailQuery.data!.photo.keyEpoch,
+          publicKey!,
+        ),
+      );
+    },
+  });
+
+  const capsuleUnlocked = Boolean(
+    capsule && isTimeCapsuleUnlocked(capsule, now),
+  );
+  const capsuleReadyQuery = useQuery({
+    queryKey: [
+      "asset-time-capsule-beacon",
+      assetId,
+      capsule?.targetRound,
+      capsuleUnlocked,
+    ],
+    enabled: Boolean(
+      capsule &&
+        unlocked &&
+        detailQuery.data?.canView &&
+        capsuleAccessQuery.data &&
+        capsuleUnlocked,
+    ),
+    retry: false,
+    refetchInterval: (query) =>
+      query.state.status === "error" ? 10_000 : false,
+    queryFn: () => verifyTimeCapsuleBeacon(capsule!),
   });
 
   const previewQuery = useQuery({
@@ -96,16 +177,19 @@ export function AssetPage({ assetId }: { assetId: `0x${string}` }) {
         address &&
         detailQuery.data?.canView &&
         detailQuery.data.photo &&
-        detailQuery.data.activity,
+        detailQuery.data.activity &&
+        (!detailQuery.data.photo.isTimeCapsule ||
+          (viewRequested && capsuleReadyQuery.data === capsule?.targetRound)),
     ),
     gcTime: 0,
     queryFn: async () => {
-      const { photo, activity } = detailQuery.data!;
+      const { photo, activity, capsule: loadedCapsule } = detailQuery.data!;
       const result = await runWithPrivateKey((privateKey) =>
         decryptPhotoPreview(
           photo.activityId.toString(),
           activity,
           photo,
+          loadedCapsule,
           address!,
           privateKey,
         ),
@@ -148,6 +232,7 @@ export function AssetPage({ assetId }: { assetId: `0x${string}` }) {
           detailQuery.data.photo.activityId.toString(),
           detailQuery.data.activity,
           detailQuery.data.photo,
+          detailQuery.data.capsule,
           previewQuery.data.metadata,
           address,
           privateKey,
@@ -258,6 +343,21 @@ export function AssetPage({ assetId }: { assetId: `0x${string}` }) {
     );
   }
   const explorer = TARGET_CHAIN.blockExplorers?.default.url;
+  const countdownText = capsule
+    ? (() => {
+        const totalMinutes = Math.ceil(
+          Math.max(0, Number(capsule.unlockAt) * 1000 - now) / 60_000,
+        );
+        const days = Math.floor(totalMinutes / (24 * 60));
+        const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+        const minutes = totalMinutes % 60;
+        return days > 0
+          ? `${days} 天 ${hours} 小时`
+          : hours > 0
+            ? `${hours} 小时 ${minutes} 分`
+            : `${Math.max(1, minutes)} 分`;
+      })()
+    : "";
 
   return (
     <div>
@@ -279,6 +379,59 @@ export function AssetPage({ assetId }: { assetId: `0x${string}` }) {
               <LockKeyhole size={28} />
               <h2>没有查看权限</h2>
               <p>当前钱包不是此活动的授权查看者。</p>
+            </div>
+          ) : capsule && capsuleAccessQuery.isLoading ? (
+            <div className="asset-locked">
+              <LoaderCircle className="spin" size={24} />
+              <p>正在核对时间胶囊代际权限</p>
+            </div>
+          ) : capsule && capsuleAccessQuery.data === false ? (
+            <div className="asset-locked asset-locked-error">
+              <KeyRound size={26} />
+              <h2>没有时间胶囊查看权限</h2>
+              <p>当前地址没有第 {photo.keyEpoch} 代活动密钥授权。</p>
+            </div>
+          ) : capsule && !capsuleUnlocked ? (
+            <div className="asset-locked time-capsule-locked">
+              <Clock3 size={28} />
+              <h2>时间胶囊锁定中</h2>
+              <p>
+                目标解锁时间 {formatUnixDate(capsule.unlockAt)}，约 {countdownText} 后
+                检查时间证明。
+              </p>
+            </div>
+          ) : capsule && capsuleReadyQuery.isLoading ? (
+            <div className="asset-locked">
+              <LoaderCircle className="spin" size={24} />
+              <p>正在验证 Drand 目标轮次时间证明</p>
+            </div>
+          ) : capsule && capsuleReadyQuery.isError ? (
+            <div className="asset-locked asset-locked-error">
+              <Clock3 size={26} />
+              <h2>正在等待时间证明</h2>
+              <p>
+                解锁不会早于设定时间；Drand 或网络异常时可能延迟更久。
+              </p>
+              <button
+                className="button button-secondary"
+                type="button"
+                onClick={() => void capsuleReadyQuery.refetch()}
+              >
+                重新检查
+              </button>
+            </div>
+          ) : capsule && !viewRequested ? (
+            <div className="asset-locked time-capsule-ready">
+              <Eye size={28} />
+              <h2>时间证明已验证</h2>
+              <p>点击后才使用代际密钥和胶囊密钥解密预览。</p>
+              <button
+                className="button button-primary"
+                type="button"
+                onClick={() => setViewRequested(true)}
+              >
+                查看照片
+              </button>
             </div>
           ) : previewQuery.isLoading ? (
             <div className="asset-locked">
@@ -321,6 +474,12 @@ export function AssetPage({ assetId }: { assetId: `0x${string}` }) {
               <KeyRound size={14} />
               密钥代际 {photo.keyEpoch}
             </span>
+            {capsule ? (
+              <span className="time-capsule-badge">
+                <Clock3 size={14} />
+                时间胶囊 · {formatUnixDate(capsule.unlockAt)}
+              </span>
+            ) : null}
           </div>
 
           <div className="asset-actions">
@@ -383,6 +542,18 @@ export function AssetPage({ assetId }: { assetId: `0x${string}` }) {
               <dt>元数据对象</dt>
               <dd>{shortHash(photo.metadataTxId)}</dd>
             </div>
+            {capsule ? (
+              <>
+                <div>
+                  <dt>时间锁对象</dt>
+                  <dd>{shortHash(capsule.tlockCiphertextTxId)}</dd>
+                </div>
+                <div>
+                  <dt>目标轮次</dt>
+                  <dd>{capsule.targetRound}</dd>
+                </div>
+              </>
+            ) : null}
             <div>
               <dt>活动所有者</dt>
               <dd>{shortAddress(activity.owner)}</dd>

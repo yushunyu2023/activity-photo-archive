@@ -9,6 +9,7 @@ import type {
   ActivityMembership,
   ActivityRecord,
   PhotoRecord,
+  TimeCapsuleRecord,
 } from "@/lib/types";
 
 type ActivityReadResult = {
@@ -19,6 +20,21 @@ type ActivityReadResult = {
   keyManifestTxId: `0x${string}`;
   keyManifestHash: `0x${string}`;
   exists: boolean;
+};
+
+type PhotoReadResult = Omit<PhotoRecord, "keyEpoch"> & {
+  keyEpoch: number | bigint;
+};
+
+type TimeCapsuleReadResult = Omit<TimeCapsuleRecord, "unlockAt" | "genesisTime"> & {
+  unlockAt: bigint;
+  genesisTime: bigint;
+};
+
+export type ActivityPhotoEntry = {
+  assetId: `0x${string}`;
+  photo: PhotoRecord;
+  capsule?: TimeCapsuleRecord;
 };
 
 const configuredLogBlockRange = BigInt(
@@ -188,7 +204,7 @@ export async function listActivitiesForAccount(
 export async function listActivityPhotos(
   publicClient: PublicClient,
   activityId: bigint,
-): Promise<Array<{ assetId: `0x${string}`; photo: PhotoRecord }>> {
+): Promise<ActivityPhotoEntry[]> {
   const address = requireRegistryAddress();
   const logs = await getPhotoPublishedLogs(publicClient, address, activityId);
 
@@ -202,14 +218,18 @@ export async function listActivityPhotos(
           abi: ACTIVITY_PHOTO_REGISTRY_ABI,
           functionName: "getPhoto",
           args: [assetId],
-        })) as PhotoRecord;
+        })) as PhotoReadResult;
+        const photo: PhotoRecord = {
+          ...result,
+          keyEpoch: Number(result.keyEpoch),
+        };
 
         return {
           assetId,
-          photo: {
-            ...result,
-            keyEpoch: Number(result.keyEpoch),
-          },
+          photo,
+          capsule: photo.isTimeCapsule
+            ? await readTimeCapsule(publicClient, assetId)
+            : undefined,
         };
       }),
   );
@@ -228,11 +248,29 @@ export async function readPhoto(
     abi: ACTIVITY_PHOTO_REGISTRY_ABI,
     functionName: "getPhoto",
     args: [assetId],
-  })) as PhotoRecord;
+  })) as PhotoReadResult;
 
   return {
     ...result,
     keyEpoch: Number(result.keyEpoch),
+  };
+}
+
+export async function readTimeCapsule(
+  publicClient: PublicClient,
+  assetId: `0x${string}`,
+): Promise<TimeCapsuleRecord> {
+  const result = (await publicClient.readContract({
+    address: requireRegistryAddress(),
+    abi: ACTIVITY_PHOTO_REGISTRY_ABI,
+    functionName: "getTimeCapsule",
+    args: [assetId],
+  })) as TimeCapsuleReadResult;
+
+  return {
+    ...result,
+    unlockAt: BigInt(result.unlockAt),
+    genesisTime: BigInt(result.genesisTime),
   };
 }
 
@@ -249,10 +287,7 @@ export async function findPhotoByContentHash(
   })) as `0x${string}`;
 
   try {
-    return {
-      assetId,
-      photo: await readPhoto(publicClient, assetId),
-    };
+    return { assetId, photo: await readPhoto(publicClient, assetId) };
   } catch (error) {
     const decoded = decodeContractError(error, ACTIVITY_PHOTO_REGISTRY_ABI);
     if (decoded?.errorName === "InvalidStorageReference") return null;

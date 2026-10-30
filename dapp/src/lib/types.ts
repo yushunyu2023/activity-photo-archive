@@ -22,6 +22,21 @@ export type PhotoRecord = {
   publishedAt: bigint;
   publisher: Address;
   keyEpoch: number;
+  isTimeCapsule: boolean;
+};
+
+export type TimeCapsuleRecord = {
+  schemaVersion: number;
+  unlockAt: bigint;
+  targetRound: number;
+  period: number;
+  genesisTime: bigint;
+  chainHash: Hex;
+  publicKey: Hex;
+  schemeID: string;
+  tlockCiphertextTxId: Hex;
+  tlockCiphertextHash: Hex;
+  exists: boolean;
 };
 
 export type KeyGrant = {
@@ -93,6 +108,14 @@ export type PhotoMetadata = {
     keyEpoch: number;
     originalNonce: Hex;
     previewNonce: Hex;
+  };
+  timeCapsule?: {
+    schemaVersion: 1;
+    unlockAt: string;
+    targetRound: number;
+    chainHash: Hex;
+    tlockCiphertextTxId: Hex;
+    tlockCiphertextHash: Hex;
   };
 };
 

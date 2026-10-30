@@ -20,6 +20,15 @@ contract ActivityPhotoRegistry {
     uint256 public constant MAX_ACTIVITY_MEMBERS = 20;
     uint8 public constant ACCOUNT_KDF_VERSION = 1;
     uint8 public constant ACCOUNT_ENCRYPTION_SCHEMA_VERSION = 1;
+    uint16 public constant TIME_CAPSULE_SCHEMA_VERSION = 1;
+    uint64 public constant MAX_TIME_CAPSULE_DURATION = 30 days;
+    bytes32 public constant QUICKNET_CHAIN_HASH = 0x52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971;
+    bytes32 public constant QUICKNET_PUBLIC_KEY_HASH = keccak256(
+        hex"83cf0f2896adee7eb8b5f01fcad3912212c437e0073e911fb90022d3e760183c8c4b450b6a0a6c3ac6a5776a2d1064510d1fec758c921cc22b0e17e63aaf4bcb5ed66304de9cf809bd274ca73bab4af5a6e9c76a4bc09e76eae8991ef5ece45a"
+    );
+    bytes32 public constant QUICKNET_SCHEME_ID_HASH = keccak256("bls-unchained-g1-rfc9380");
+    uint32 public constant QUICKNET_PERIOD = 3;
+    uint64 public constant QUICKNET_GENESIS_TIME = 1_692_803_367;
 
     struct Activity {
         address owner;
@@ -43,6 +52,41 @@ contract ActivityPhotoRegistry {
         uint64 publishedAt;
         address publisher;
         uint32 keyEpoch;
+        bool isTimeCapsule;
+    }
+
+    struct TimeCapsule {
+        uint16 schemaVersion;
+        uint64 unlockAt;
+        uint32 targetRound;
+        uint32 period;
+        uint64 genesisTime;
+        bytes32 chainHash;
+        bytes publicKey;
+        string schemeID;
+        bytes32 tlockCiphertextTxId;
+        bytes32 tlockCiphertextHash;
+        bool exists;
+    }
+
+    struct PhotoInput {
+        bytes32 photoTxId;
+        bytes32 metadataTxId;
+        bytes32 contentHash;
+        bytes32 metadataHash;
+        uint64 capturedAt;
+    }
+
+    struct TimeCapsuleInput {
+        uint64 unlockAt;
+        uint32 targetRound;
+        uint32 period;
+        uint64 genesisTime;
+        bytes32 chainHash;
+        bytes publicKey;
+        string schemeID;
+        bytes32 tlockCiphertextTxId;
+        bytes32 tlockCiphertextHash;
     }
 
     struct AccountEncryption {
@@ -62,6 +106,7 @@ contract ActivityPhotoRegistry {
     mapping(uint256 activityId => mapping(address account => bool removed)) private _removedMembers;
     mapping(bytes32 assetId => Photo photo) private _photos;
     mapping(bytes32 assetId => bool exists) private _assetExists;
+    mapping(bytes32 assetId => TimeCapsule capsule) private _timeCapsules;
     mapping(address account => AccountEncryption encryption) private _accountEncryptions;
 
     event ActivityCreated(uint256 indexed activityId, address indexed owner, string name, uint64 createdAt);
@@ -91,6 +136,18 @@ contract ActivityPhotoRegistry {
         uint32 keyEpoch,
         address indexed publisher
     );
+    event TimeCapsulePublished(
+        bytes32 indexed assetId,
+        uint256 indexed activityId,
+        bytes32 indexed tlockCiphertextTxId,
+        bytes32 tlockCiphertextHash,
+        bytes32 chainHash,
+        uint64 genesisTime,
+        uint32 period,
+        uint64 unlockAt,
+        uint32 targetRound,
+        address publisher
+    );
     error ActivityNotFound(uint256 activityId);
     error ActivityAlreadyOwned(address owner, uint256 existingActivityId);
     error NotActivityOwner(uint256 activityId, address account);
@@ -114,6 +171,11 @@ contract ActivityPhotoRegistry {
     error InvalidCapturedAt(uint64 capturedAt);
     error AssetAlreadyExists(bytes32 assetId);
     error InvalidKeyEpoch(uint32 currentEpoch, uint32 requestedEpoch);
+    error InvalidTimeCapsuleUnlockAt(uint64 unlockAt);
+    error InvalidTimeCapsuleProtocol();
+    error InvalidTimeCapsuleRound(uint32 expectedRound, uint32 actualRound);
+    error InvalidTimeCapsuleReference();
+    error TimeCapsuleNotFound(bytes32 assetId);
 
     /**
      * @notice Create an activity owned permanently by the caller. Each address can own at most one activity.
@@ -240,25 +302,103 @@ contract ActivityPhotoRegistry {
         uint64 capturedAt,
         uint32 expectedKeyEpoch
     ) external returns (bytes32 assetId) {
+        return _publishPhoto(
+            activityId,
+            PhotoInput({
+                photoTxId: photoTxId,
+                metadataTxId: metadataTxId,
+                contentHash: contentHash,
+                metadataHash: metadataHash,
+                capturedAt: capturedAt
+            }),
+            expectedKeyEpoch,
+            false
+        );
+    }
+
+    /**
+     * @notice Publish an immutable photo whose independently random capsule secret is time-locked.
+     * @dev Only the activity owner may create a time capsule. The photo itself still follows the
+     * normal activity permission model after the target beacon becomes available.
+     */
+    function publishTimeCapsule(
+        uint256 activityId,
+        bytes32 photoTxId,
+        bytes32 metadataTxId,
+        bytes32 contentHash,
+        bytes32 metadataHash,
+        uint64 capturedAt,
+        uint32 expectedKeyEpoch,
+        TimeCapsuleInput calldata capsule
+    ) external returns (bytes32 assetId) {
+        _requireOwner(activityId, msg.sender);
+        _validateTimeCapsule(capsule, photoTxId, metadataTxId);
+
+        assetId = _publishPhoto(
+            activityId,
+            PhotoInput({
+                photoTxId: photoTxId,
+                metadataTxId: metadataTxId,
+                contentHash: contentHash,
+                metadataHash: metadataHash,
+                capturedAt: capturedAt
+            }),
+            expectedKeyEpoch,
+            true
+        );
+
+        _timeCapsules[assetId] = TimeCapsule({
+            schemaVersion: TIME_CAPSULE_SCHEMA_VERSION,
+            unlockAt: capsule.unlockAt,
+            targetRound: capsule.targetRound,
+            period: capsule.period,
+            genesisTime: capsule.genesisTime,
+            chainHash: capsule.chainHash,
+            publicKey: capsule.publicKey,
+            schemeID: capsule.schemeID,
+            tlockCiphertextTxId: capsule.tlockCiphertextTxId,
+            tlockCiphertextHash: capsule.tlockCiphertextHash,
+            exists: true
+        });
+
+        emit TimeCapsulePublished(
+            assetId,
+            activityId,
+            capsule.tlockCiphertextTxId,
+            capsule.tlockCiphertextHash,
+            capsule.chainHash,
+            capsule.genesisTime,
+            capsule.period,
+            capsule.unlockAt,
+            capsule.targetRound,
+            msg.sender
+        );
+    }
+
+    function _publishPhoto(uint256 activityId, PhotoInput memory input, uint32 expectedKeyEpoch, bool isTimeCapsule)
+        private
+        returns (bytes32 assetId)
+    {
         _requireActivity(activityId);
         Activity storage activity = _activities[activityId];
         if (msg.sender != activity.owner && !_uploaders[activityId].contains(msg.sender)) {
             revert NotActivityOperator(activityId, msg.sender);
         }
 
-        if (photoTxId == bytes32(0) || metadataTxId == bytes32(0) || photoTxId == metadataTxId) {
+        if (input.photoTxId == bytes32(0) || input.metadataTxId == bytes32(0) || input.photoTxId == input.metadataTxId)
+        {
             revert InvalidStorageReference();
         }
-        if (contentHash == bytes32(0)) revert InvalidContentHash();
-        if (metadataHash == bytes32(0)) revert InvalidMetadataHash();
-        if (capturedAt == 0 || capturedAt > block.timestamp + MAX_CAPTURE_FUTURE_SKEW) {
-            revert InvalidCapturedAt(capturedAt);
+        if (input.contentHash == bytes32(0)) revert InvalidContentHash();
+        if (input.metadataHash == bytes32(0)) revert InvalidMetadataHash();
+        if (input.capturedAt == 0 || input.capturedAt > block.timestamp + MAX_CAPTURE_FUTURE_SKEW) {
+            revert InvalidCapturedAt(input.capturedAt);
         }
         if (expectedKeyEpoch != activity.keyEpoch) {
             revert InvalidKeyEpoch(activity.keyEpoch, expectedKeyEpoch);
         }
 
-        assetId = computeAssetId(activityId, contentHash);
+        assetId = computeAssetId(activityId, input.contentHash);
         if (_assetExists[assetId]) revert AssetAlreadyExists(assetId);
 
         _assetExists[assetId] = true;
@@ -266,24 +406,25 @@ contract ActivityPhotoRegistry {
             activityId: activityId,
             assetType: ASSET_TYPE_PHOTO,
             schemaVersion: SCHEMA_VERSION,
-            photoTxId: photoTxId,
-            metadataTxId: metadataTxId,
-            contentHash: contentHash,
-            metadataHash: metadataHash,
-            capturedAt: capturedAt,
+            photoTxId: input.photoTxId,
+            metadataTxId: input.metadataTxId,
+            contentHash: input.contentHash,
+            metadataHash: input.metadataHash,
+            capturedAt: input.capturedAt,
             publishedAt: uint64(block.timestamp),
             publisher: msg.sender,
-            keyEpoch: expectedKeyEpoch
+            keyEpoch: expectedKeyEpoch,
+            isTimeCapsule: isTimeCapsule
         });
 
         emit PhotoPublished(
             assetId,
             activityId,
-            photoTxId,
-            metadataTxId,
-            contentHash,
-            metadataHash,
-            capturedAt,
+            input.photoTxId,
+            input.metadataTxId,
+            input.contentHash,
+            input.metadataHash,
+            input.capturedAt,
             expectedKeyEpoch,
             msg.sender
         );
@@ -305,6 +446,13 @@ contract ActivityPhotoRegistry {
     function getPhoto(bytes32 assetId) external view returns (Photo memory) {
         if (!_assetExists[assetId]) revert InvalidStorageReference();
         return _photos[assetId];
+    }
+
+    function getTimeCapsule(bytes32 assetId) external view returns (TimeCapsule memory) {
+        if (!_assetExists[assetId] || !_photos[assetId].isTimeCapsule) {
+            revert TimeCapsuleNotFound(assetId);
+        }
+        return _timeCapsules[assetId];
     }
 
     function isUploader(uint256 activityId, address account) public view returns (bool) {
@@ -356,6 +504,39 @@ contract ActivityPhotoRegistry {
     function _requireOwner(uint256 activityId, address account) private view {
         _requireActivity(activityId);
         if (_activities[activityId].owner != account) revert NotActivityOwner(activityId, account);
+    }
+
+    function _validateTimeCapsule(TimeCapsuleInput calldata capsule, bytes32 photoTxId, bytes32 metadataTxId)
+        private
+        view
+    {
+        if (
+            capsule.unlockAt <= block.timestamp || capsule.unlockAt % 60 != 0
+                || capsule.unlockAt > block.timestamp + MAX_TIME_CAPSULE_DURATION
+        ) {
+            revert InvalidTimeCapsuleUnlockAt(capsule.unlockAt);
+        }
+        if (
+            capsule.chainHash != QUICKNET_CHAIN_HASH || capsule.period != QUICKNET_PERIOD
+                || capsule.genesisTime != QUICKNET_GENESIS_TIME || capsule.unlockAt <= capsule.genesisTime
+                || keccak256(capsule.publicKey) != QUICKNET_PUBLIC_KEY_HASH
+                || keccak256(bytes(capsule.schemeID)) != QUICKNET_SCHEME_ID_HASH
+        ) {
+            revert InvalidTimeCapsuleProtocol();
+        }
+        if (
+            capsule.tlockCiphertextTxId == bytes32(0) || capsule.tlockCiphertextHash == bytes32(0)
+                || capsule.tlockCiphertextTxId == photoTxId || capsule.tlockCiphertextTxId == metadataTxId
+                || capsule.tlockCiphertextTxId == capsule.tlockCiphertextHash
+        ) {
+            revert InvalidTimeCapsuleReference();
+        }
+
+        uint256 elapsed = uint256(capsule.unlockAt) - uint256(capsule.genesisTime);
+        uint256 expectedRound = (elapsed + uint256(capsule.period) - 1) / uint256(capsule.period) + 1;
+        if (expectedRound > type(uint32).max || capsule.targetRound != uint32(expectedRound)) {
+            revert InvalidTimeCapsuleRound(uint32(expectedRound), capsule.targetRound);
+        }
     }
 
     function _validateNewMember(uint256 activityId, address account) private view {

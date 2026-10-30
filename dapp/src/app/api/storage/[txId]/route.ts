@@ -33,8 +33,13 @@ export async function GET(
 
   try {
     if (process.env.ARWEAVE_GATEWAY_URL) {
-      const gatewayResponse = await fetchFromGateway(txId);
-      if (gatewayResponse) return gatewayResponse;
+      try {
+        const gatewayResponse = await fetchFromGateway(txId);
+        if (gatewayResponse) return gatewayResponse;
+      } catch {
+        // Local development can keep a production gateway configured while
+        // uploads are still stored on disk.
+      }
     }
 
     const storageRoot = path.join(process.cwd(), ".data", "storage");
