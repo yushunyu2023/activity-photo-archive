@@ -4,6 +4,9 @@ Activity Photo Archive 是一个可独立部署的活动照片长期保存项目
 钱包访问 DApp，照片在浏览器端加密后上传至 Arweave 或兼容存储服务，Base 合约
 保存不可变照片索引、成员权限和密钥代际信息。
 
+This is a Web3 project for uploading and privately sharing photos, with time
+capsule support.
+
 项目不依赖任何产品需求、变更记录或缺陷跟踪文档，包含以下内容：
 
 - `src/ActivityPhotoRegistry.sol`：活动、成员、代际密钥清单和照片索引合约
