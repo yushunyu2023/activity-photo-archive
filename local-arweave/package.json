@@ -1,0 +1,19 @@
+{
+  "name": "activity-photo-local-arweave",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.19.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node scripts/start.mjs",
+    "check": "node scripts/check.mjs",
+    "reset": "node scripts/reset.mjs"
+  },
+  "dependencies": {
+    "arlocal": "1.1.66",
+    "arweave": "2.1.0"
+  }
+}

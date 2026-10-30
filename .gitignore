@@ -1,0 +1,29 @@
+# Foundry
+cache/
+out/
+artifacts/
+broadcast/*/31337/
+broadcast/**/dry-run/
+
+# Environment and local data
+.env
+.env.*
+!.env.example
+!.env.arlocal.example
+
+# DApp
+dapp/node_modules/
+dapp/.next/
+dapp/.data/
+dapp/test-results/
+dapp/playwright-report/
+dapp/tsconfig.tsbuildinfo
+
+# Local Arweave adapter
+local-arweave/node_modules/
+local-arweave/.data/
+local-arweave/logs/
+
+# Editors and OS
+.DS_Store
+.idea/

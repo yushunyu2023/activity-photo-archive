@@ -1,0 +1,33 @@
+{
+  "name": "activity-photo-dapp",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "@coinbase/wallet-sdk": "^4.4.0",
+    "@noble/curves": "2.4.0",
+    "@noble/hashes": "2.0.1",
+    "@tanstack/react-query": "5.104.5",
+    "@walletconnect/ethereum-provider": "^2.26.0",
+    "exifr": "7.1.3",
+    "lucide-react": "1.61.0",
+    "next": "16.4.3",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "viem": "2.57.10",
+    "wagmi": "3.7.9"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.50.1",
+    "@types/node": "^24.19.2",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "typescript": "5.9.3"
+  }
+}
